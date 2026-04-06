@@ -3,7 +3,6 @@ import math
 import os
 import time
 import warnings
-from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -21,12 +20,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
-
-
-@dataclass
-class TrainingArtifacts:
-    results: List[Dict]
-    summary: Dict
 
 
 def _json_safe(obj):
@@ -234,10 +227,18 @@ def _initialize_client_model(n_features: int, seed: int, alpha: float) -> SGDCla
         alpha=alpha,
         fit_intercept=True,
         random_state=seed,
-        class_weight="balanced",
         learning_rate="optimal",
         average=True,
     )
+
+
+def _build_sample_weights(y_client: np.ndarray) -> np.ndarray:
+    y_client = np.asarray(y_client).astype(int)
+    class_counts = np.bincount(y_client, minlength=2).astype(float)
+    class_counts[class_counts == 0] = 1.0
+    class_weights = len(y_client) / (2.0 * class_counts)
+    weights = np.array([class_weights[label] for label in y_client], dtype=float)
+    return weights
 
 
 def _fit_local_client(
@@ -252,11 +253,11 @@ def _fit_local_client(
     enable_fedprox: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
     clf = _initialize_client_model(n_features=x_client.shape[1], seed=seed, alpha=alpha)
-
     classes = np.array([0, 1], dtype=int)
+    sample_weights = _build_sample_weights(y_client)
 
-    for epoch in range(local_epochs):
-        clf.partial_fit(x_client, y_client, classes=classes)
+    for _ in range(local_epochs):
+        clf.partial_fit(x_client, y_client, classes=classes, sample_weight=sample_weights)
 
         if enable_fedprox and hasattr(clf, "coef_"):
             clf.coef_ = clf.coef_ - fedprox_mu * (clf.coef_ - global_coef)
@@ -312,12 +313,7 @@ def _evaluate_linear_model(coef: np.ndarray, intercept: np.ndarray, x_val: np.nd
     return _compute_metrics(y_val, probs)
 
 
-def _build_shap_like_output(
-    feature_names: List[str],
-    coef: np.ndarray,
-    x_reference: pd.DataFrame,
-    cfg: Dict,
-) -> Dict:
+def _build_shap_like_output(feature_names: List[str], coef: np.ndarray, cfg: Dict) -> Dict:
     top_k = 10
     abs_coef = np.abs(coef.reshape(-1))
     importance_df = pd.DataFrame(
@@ -336,7 +332,7 @@ def _build_shap_like_output(
         "shap_top_features": top_features,
         "shap_note": (
             "This cloud-safe backend uses coefficient-based feature influence as a SHAP-like explanation layer. "
-            "It is designed for reliability on Streamlit Cloud and can later be replaced with full SHAP computation."
+            "It can later be replaced with full SHAP computation."
         ),
     }
 
@@ -368,7 +364,6 @@ def run_training(config: Dict) -> Tuple[List[Dict], Dict]:
 
     df = _add_feature_engineering(df_raw, config)
     X_df, y = _build_features(df)
-
     feature_names = X_df.columns.tolist()
 
     x_train_df, x_val_df, y_train, y_val = train_test_split(
@@ -421,7 +416,7 @@ def run_training(config: Dict) -> Tuple[List[Dict], Dict]:
             x_client = x_train[idx]
             y_client = y_train.to_numpy()[idx]
 
-            if len(np.unique(y_client)) < 2:
+            if len(y_client) < 2:
                 continue
 
             local_coef, local_intercept = _fit_local_client(
@@ -474,15 +469,8 @@ def run_training(config: Dict) -> Tuple[List[Dict], Dict]:
             break
 
     global_coef, global_intercept = best_state
-
     final_metrics = _evaluate_linear_model(global_coef, global_intercept, x_val, y_val.to_numpy())
-
-    shap_output = _build_shap_like_output(
-        feature_names=feature_names,
-        coef=global_coef,
-        x_reference=x_val_df,
-        cfg=config,
-    )
+    shap_output = _build_shap_like_output(feature_names=feature_names, coef=global_coef, cfg=config)
 
     summary = {
         "status": "training_completed",
